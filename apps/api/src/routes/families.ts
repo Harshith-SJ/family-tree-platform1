@@ -289,41 +289,61 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
     const driver = getDriver();
     const session = driver.session();
     try {
+      if (body.sourceId === body.targetId) {
+        return reply.code(400).send({ message: 'Cannot create a relationship to the same person' });
+      }
+      // Ensure both nodes exist and are in the family
+      const check = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (a:Person { id: $sourceId })-[:MEMBER_OF]->(f:Family { id: $familyId })
+           MATCH (b:Person { id: $targetId })-[:MEMBER_OF]->(f)
+           RETURN a.id as a, b.id as b`,
+          { familyId, sourceId: body.sourceId, targetId: body.targetId }
+        )
+      );
+      if (check.records.length === 0) {
+        return reply.code(400).send({ message: 'Both people must be in the same family' });
+      }
   if (body.type === 'SPOUSE') {
-        const res = await session.executeWrite((tx) =>
+    const res = await session.executeWrite((tx) =>
           tx.run(
             `MATCH (a:Person { id: $sourceId })-[:MEMBER_OF]->(:Family { id: $familyId }),
                    (b:Person { id: $targetId })-[:MEMBER_OF]->(:Family { id: $familyId })
              MERGE (a)-[r:SPOUSE_OF]->(b)
-     ON CREATE SET r.id = randomUUID(), r.label = coalesce($label, 'SPOUSE')
+             SET r.id = coalesce(r.id, randomUUID()), r.label = coalesce(r.label, coalesce($label, 'SPOUSE'))
              MERGE (b)-[r2:SPOUSE_OF]->(a)
-     ON CREATE SET r2.id = randomUUID(), r2.label = coalesce($label, 'SPOUSE')
+             SET r2.id = coalesce(r2.id, randomUUID()), r2.label = coalesce(r2.label, coalesce($label, 'SPOUSE'))
              RETURN r`,
-            { familyId, ...body }
+      { familyId, ...body, label: body.label ?? null, type: body.type }
           )
         );
-  const r = res.records[0]?.get('r');
-  const edge = { id: r.properties.id, sourceId: body.sourceId, targetId: body.targetId, type: body.type, label: r.properties.label };
+        const r = res.records[0]?.get('r');
+        if (!r) return reply.code(400).send({ message: 'Could not create spouse relationship' });
+        const edge = { id: r.properties.id, sourceId: body.sourceId, targetId: body.targetId, type: body.type, label: r.properties.label };
   getIO()?.to(familyId).emit('edge:created', edge);
   return reply.code(201).send({ edge });
       } else {
         // PARENT, SON, DAUGHTER will be represented as PARENT_OF edge; label carries the specific type
-        const res = await session.executeWrite((tx) =>
+    const res = await session.executeWrite((tx) =>
           tx.run(
             `MATCH (a:Person { id: $sourceId })-[:MEMBER_OF]->(:Family { id: $familyId }),
                    (b:Person { id: $targetId })-[:MEMBER_OF]->(:Family { id: $familyId })
              MERGE (a)-[r:PARENT_OF]->(b)
-             ON CREATE SET r.id = randomUUID(), r.label = coalesce($label, $type)
+             SET r.id = coalesce(r.id, randomUUID()), r.label = coalesce(r.label, coalesce($label, $type))
              RETURN r`,
-            { familyId, ...body }
+      { familyId, ...body, label: body.label ?? null, type: body.type }
           )
         );
-  const r = res.records[0]?.get('r');
-  const edge = { id: r.properties.id, sourceId: body.sourceId, targetId: body.targetId, type: body.type, label: body.label ?? body.type };
+        const r = res.records[0]?.get('r');
+        if (!r) return reply.code(400).send({ message: 'Could not create parent relationship' });
+        const edge = { id: r.properties.id, sourceId: body.sourceId, targetId: body.targetId, type: body.type, label: r.properties.label };
   getIO()?.to(familyId).emit('edge:created', edge);
   return reply.code(201).send({ edge });
-      }
-    } finally {
+       }
+     } catch (err: any) {
+      req.log.error({ err, familyId, body }, 'Failed to create edge');
+      return reply.code(500).send({ message: 'Failed to create relationship', error: String(err?.message || err) });
+     } finally {
       await session.close();
     }
   });

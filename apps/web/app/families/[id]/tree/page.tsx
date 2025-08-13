@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'next/navigation';
-import { ReactFlow, type Edge, type Node, Background, Controls, MarkerType, Handle, Position } from '@xyflow/react';
+import { ReactFlow, type Edge, type Node, Background, Controls, MarkerType, Handle, Position, applyNodeChanges } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import * as htmlToImage from 'html-to-image';
 import { api } from '@/lib/api';
@@ -19,8 +19,16 @@ export default function FamilyTreeByIdPage() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [familyName, setFamilyName] = useState<string>("");
+  const [manualToId, setManualToId] = useState<string>('');
+  const [manualType, setManualType] = useState<EdgeType | ''>('');
   // Require explicit selection; empty means not chosen yet
   const [edgeType, setEdgeType] = useState<EdgeType | ''>('');
+  // Controlled Add Person inputs
+  const [pName, setPName] = useState('');
+  const [pEmail, setPEmail] = useState('');
+  const [pGender, setPGender] = useState('');
+  const [pBirth, setPBirth] = useState('');
+  const [pTemp, setPTemp] = useState('');
   const canvasRef = useRef<HTMLDivElement | null>(null);
   const [rfInstance, setRfInstance] = useState<any>(null);
   const [snap, setSnap] = useState<boolean>(false);
@@ -93,15 +101,17 @@ export default function FamilyTreeByIdPage() {
   const onEdgeDeleted = (p: { id: string }) => setEdges((prev) => prev.filter((e) => e.id !== p.id));
   s.on('node:deleted', onNodeDeleted);
   s.on('edge:deleted', onEdgeDeleted);
-    return () => { s.off('node:upsert', upsert); s.off('node:move', move); s.off('edge:created', edgeCreated); };
+    return () => {
+      s.off('node:upsert', upsert);
+      s.off('node:move', move);
+      s.off('edge:created', edgeCreated);
+      s.off('node:deleted', onNodeDeleted);
+      s.off('edge:deleted', onEdgeDeleted);
+    };
   }, [familyId]);
 
   const onNodesChange = (changes: any) => {
-    setNodes((nds) => nds.map((n) => {
-      const change = changes.find((c: any) => c.id === n.id && c.type === 'position');
-      if (change) return { ...n, position: change.position };
-      return n;
-    }));
+    setNodes((nds) => applyNodeChanges(changes, nds));
   };
 
   const onNodeDragStop = async (_: any, node: Node) => {
@@ -131,13 +141,19 @@ export default function FamilyTreeByIdPage() {
       const exists = edges.some((e) => e.source === params.source && e.target === params.target);
       if (exists) { toast.error('Relationship already exists'); return; }
     }
-    try {
-      await api(`/families/${familyId}/edges`, { method: 'POST', body: JSON.stringify({ sourceId: params.source, targetId: params.target, type: edgeType }) });
-    } catch { toast.error('Failed to create relationship'); }
+  await createEdge(params.source, params.target, edgeType);
   };
 
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedNodeId) || null, [nodes, selectedNodeId]);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  const effectiveManualType = (edgeType || manualType) as EdgeType | '';
+  const manualDuplicate = useMemo(() => {
+    if (!selectedNodeId || !manualToId || !effectiveManualType) return false;
+    if (effectiveManualType === 'SPOUSE') {
+      return edges.some((e) => ((e.source === selectedNodeId && e.target === manualToId) || (e.source === manualToId && e.target === selectedNodeId)));
+    }
+    return edges.some((e) => e.source === selectedNodeId && e.target === manualToId);
+  }, [edges, selectedNodeId, manualToId, effectiveManualType]);
 
   async function createFamily(name: string) {
     const res = await api<{ family: { id: string } }>(`/families`, { method: 'POST', body: JSON.stringify({ name }) });
@@ -166,11 +182,34 @@ export default function FamilyTreeByIdPage() {
     if (!edgeType) {
       // already validated, but keep guard
     } else if (selectedNodeId) {
-      try { await api(`/families/${familyId}/edges`, { method: 'POST', body: JSON.stringify({ sourceId: selectedNodeId, targetId: node.id, type: edgeType }) }); } catch {}
+      await createEdge(selectedNodeId, node.id, edgeType, true);
     } else if (currentUserId) {
-      try { await api(`/families/${familyId}/edges`, { method: 'POST', body: JSON.stringify({ sourceId: currentUserId, targetId: node.id, type: edgeType }) }); } catch {}
+      await createEdge(currentUserId, node.id, edgeType, true);
     }
     toast.success('Person added');
+  }
+
+  async function createEdge(sourceId: string, targetId: string, type: EdgeType, silent = false) {
+    if (!familyId) return;
+    try {
+      const res = await api<{ edge: { id: string; sourceId: string; targetId: string; type: string; label?: string } }>(
+        `/families/${familyId}/edges`,
+        { method: 'POST', body: JSON.stringify({ sourceId, targetId, type }) }
+      );
+      // Optimistically update if socket misses
+      setEdges((prev) => {
+        if (prev.some((e) => e.id === res.edge.id)) return prev;
+        const label = res.edge.label || res.edge.type;
+        return [
+          ...prev.filter((e) => !(e.source === res.edge.sourceId && e.target === res.edge.targetId)),
+          { id: res.edge.id, source: res.edge.sourceId, target: res.edge.targetId, label, data: { type: label } } as any,
+        ];
+      });
+      if (!silent) toast.success('Relationship created');
+    } catch (err: any) {
+      const msg = err?.message || 'Failed to create relationship';
+      if (!silent) toast.error(msg);
+    }
   }
 
   async function updateSelectedPosition(x: number, y: number) {
@@ -218,34 +257,25 @@ export default function FamilyTreeByIdPage() {
           <h2 className="font-semibold mb-2">Add Person</h2>
           <div className="space-y-2">
             <div className="space-y-2">
-              <input id="person-name" placeholder="Name" className="border rounded px-2 py-1 w-full" required />
-              <input id="person-email" placeholder="Email" type="email" className="border rounded px-2 py-1 w-full" required />
+              <input value={pName} onChange={(e)=>setPName(e.target.value)} placeholder="Name" className="border rounded px-2 py-1 w-full" required />
+              <input value={pEmail} onChange={(e)=>setPEmail(e.target.value)} placeholder="Email" type="email" className="border rounded px-2 py-1 w-full" required />
             </div>
             <div className="space-y-2">
-              <select id="person-gender" className="border rounded px-2 py-1 w-full">
+              <select value={pGender} onChange={(e)=>setPGender(e.target.value)} className="border rounded px-2 py-1 w-full">
                 <option value="">Gender</option>
                 <option value="MALE">Male</option>
                 <option value="FEMALE">Female</option>
                 <option value="OTHER">Other</option>
               </select>
-              <input id="person-birth" type="date" placeholder="Birth date" className="border rounded px-2 py-1 w-full" />
+              <input value={pBirth} onChange={(e)=>setPBirth(e.target.value)} type="date" placeholder="Birth date" className="border rounded px-2 py-1 w-full" />
             </div>
-            <input id="person-temp-password" type="password" placeholder="Temporary password (min 8 chars)" minLength={8} className="border rounded px-2 py-1 w-full" required />
+            <input value={pTemp} onChange={(e)=>setPTemp(e.target.value)} type="password" placeholder="Temporary password (min 8 chars)" minLength={8} className="border rounded px-2 py-1 w-full" required />
             <div className="flex gap-2 justify-end">
               <button className="bg-gray-800 text-white px-3 py-1 rounded" onClick={() => {
-                const name = (document.getElementById('person-name') as HTMLInputElement).value?.trim();
-                const email = (document.getElementById('person-email') as HTMLInputElement).value?.trim();
-                const gender = (document.getElementById('person-gender') as HTMLSelectElement).value || undefined;
-                const birthDate = (document.getElementById('person-birth') as HTMLInputElement).value || undefined;
-                const tempPassword = (document.getElementById('person-temp-password') as HTMLInputElement).value || undefined;
+                const name = pName.trim();
                 if (!name) { toast.error('Name is required'); return; }
-                if (!edgeType) { toast.error('Select relationship type'); return; }
-                upsertNode(name, email || '', gender, birthDate, tempPassword);
-                (document.getElementById('person-name') as HTMLInputElement).value = '';
-                (document.getElementById('person-email') as HTMLInputElement).value = '';
-                (document.getElementById('person-gender') as HTMLSelectElement).value = '';
-                (document.getElementById('person-birth') as HTMLInputElement).value = '';
-                (document.getElementById('person-temp-password') as HTMLInputElement).value = '';
+                upsertNode(name, pEmail.trim() || '', pGender || undefined, pBirth || undefined, pTemp || undefined);
+                setPName(''); setPEmail(''); setPGender(''); setPBirth(''); setPTemp('');
               }}>Add</button>
             </div>
             <p className="text-[11px] text-gray-500">Tip: Select a person in the canvas to link from. If none is selected, we’ll link from you.</p>
@@ -253,8 +283,55 @@ export default function FamilyTreeByIdPage() {
         </div>
 
         <div>
-          <h2 className="font-semibold mb-2">Manual Edge</h2>
-          <p className="text-xs text-gray-500">Pick a type above, then drag between node handles to create the relationship.</p>
+          <h2 className="font-semibold mb-2">Add Relationship</h2>
+          <div className="space-y-2 text-sm">
+            <div>
+              <div className="text-gray-600">From</div>
+              <div className="border rounded px-2 py-1 bg-slate-50 h-9 flex items-center text-xs">{String(nodes.find(n=>n.id===selectedNodeId)?.data?.name || 'Select a node in canvas')}</div>
+            </div>
+            <div>
+              <label className="block text-gray-600 mb-1">To</label>
+              <select className="border rounded px-2 py-1 w-full" value={manualToId} onChange={(e)=>setManualToId(e.target.value)}>
+                <option value="">Select target…</option>
+                {nodes.filter(n=>n.id!==selectedNodeId).map(n=> (
+                  <option key={n.id} value={n.id}>{String(n.data?.name || 'Unnamed')}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-gray-600 mb-1">Relationship{edgeType ? ` (using global: ${edgeType})` : ''}</label>
+              <select
+                className="border rounded px-2 py-1 w-full disabled:bg-slate-100 disabled:text-slate-500"
+                value={edgeType || manualType}
+                disabled={!!edgeType}
+                onChange={(e)=>setManualType((e.target.value||'') as any)}
+              >
+                <option value="">Select type…</option>
+                <option value="PARENT">PARENT</option>
+                <option value="SPOUSE">SPOUSE</option>
+                <option value="SON">SON</option>
+                <option value="DAUGHTER">DAUGHTER</option>
+              </select>
+            </div>
+            <div className="flex justify-end">
+              <button
+                className="bg-gray-800 text-white px-3 py-1 rounded disabled:opacity-50"
+                disabled={!selectedNodeId || !manualToId || !effectiveManualType || manualDuplicate}
+                onClick={async ()=>{
+                  if (!familyId || !selectedNodeId || !manualToId || !effectiveManualType) return;
+                  if (selectedNodeId === manualToId) { toast.error('Cannot link to itself'); return; }
+                  if (manualDuplicate) { toast.error('Relationship already exists'); return; }
+                  await createEdge(selectedNodeId, manualToId, effectiveManualType as EdgeType);
+                  setManualToId('');
+                  setManualType('');
+                }}
+              >Add</button>
+            </div>
+            {manualDuplicate && (
+              <p className="text-xs text-orange-600">A relationship between these two already exists{effectiveManualType === 'SPOUSE' ? ' (spouse either direction)' : ''}.</p>
+            )}
+            <p className="text-[11px] text-gray-500">Or drag between node handles (choose type in Relationship Type section first).</p>
+          </div>
         </div>
 
         {selectedNode && (
@@ -334,14 +411,12 @@ export default function FamilyTreeByIdPage() {
           nodes={nodes}
           edges={edges.map((e) => {
             const type = e.data?.type ?? e.label;
-            const parentLike = type === 'PARENT' || type === 'SON' || type === 'DAUGHTER';
-            if (parentLike) {
-              return { ...e, animated: false, markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: type === 'PARENT' ? '#2563eb' : '#16a34a' } };
+            const base = { ...e, label: type } as any;
+            // Uniform blue color; arrow for directional parent-like edges
+            if (type === 'PARENT' || type === 'SON' || type === 'DAUGHTER') {
+              return { ...base, markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: '#2563eb' } };
             }
-            if (type === 'SPOUSE') {
-              return { ...e, style: { stroke: '#2563eb' } };
-            }
-            return e;
+            return { ...base, style: { stroke: '#2563eb' } };
           })}
           onNodesChange={onNodesChange}
           onConnect={onConnect}
