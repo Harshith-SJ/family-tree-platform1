@@ -8,7 +8,7 @@ import { api } from '@/lib/api';
 import { getSocket } from '@/lib/socket';
 import { toast } from '@/lib/toast';
 
-type EdgeType = 'SPOUSE' | 'PARENT' | 'SON' | 'DAUGHTER';
+type EdgeType = 'SPOUSE' | 'MOTHER' | 'FATHER' | 'SON' | 'DAUGHTER';
 
 export default function FamilyTreeByIdPage() {
   const params = useParams<{ id: string }>();
@@ -137,7 +137,7 @@ export default function FamilyTreeByIdPage() {
       if (exists) { toast.error('Spouse relationship already exists'); return; }
     }
     // prevent duplicate parent-like edges
-    if (edgeType === 'PARENT' || edgeType === 'SON' || edgeType === 'DAUGHTER') {
+    if (edgeType === 'MOTHER' || edgeType === 'FATHER' || edgeType === 'SON' || edgeType === 'DAUGHTER') {
       const exists = edges.some((e) => e.source === params.source && e.target === params.target);
       if (exists) { toast.error('Relationship already exists'); return; }
     }
@@ -218,194 +218,130 @@ export default function FamilyTreeByIdPage() {
     await api(`/families/${familyId}/nodes/${selectedNode.id}/position`, { method: 'PATCH', body: JSON.stringify({ posX: x, posY: y }) });
   }
 
+  const [showAddPerson, setShowAddPerson] = useState(false);
+  const [showAddRel, setShowAddRel] = useState(false);
+  const [showMore, setShowMore] = useState(false);
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
+  const [toolbarHeight, setToolbarHeight] = useState(0);
+  const [transformState, setTransformState] = useState<{ x: number; y: number; zoom: number }>({ x: 0, y: 0, zoom: 1 });
+  // Measure toolbar height (for popover positioning) when visibility changes / resize
+  useEffect(() => {
+    function measure() { if (toolbarRef.current) setToolbarHeight(toolbarRef.current.getBoundingClientRect().height); }
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [showAddPerson, showAddRel]);
+  // Keyboard shortcuts: A(Add Person), R(Add Relationship), F(Fit)
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      if (['input','textarea','select'].includes(tag)) return; // avoid while typing
+      if (e.key === 'a' || e.key === 'A') { setShowAddPerson(p => !p); setShowAddRel(false); }
+      if (e.key === 'r' || e.key === 'R') { setShowAddRel(p => !p); setShowAddPerson(false); }
+      if (e.key === 'f' || e.key === 'F') { try { rfInstance?.fitView?.({ padding: 0.2 }); } catch {} }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [rfInstance]);
+  const manualFormType = edgeType || manualType; // display value
   return (
-    // Fit within viewport beneath the top nav; remove extra vertical margins to prevent scrolling
-    <main className="h-[calc(100dvh-96px)] mx-4 my-0 border rounded overflow-hidden grid grid-cols-[320px_1fr]">
-      <aside className="p-3 border-r space-y-4 bg-white overflow-y-auto">
-        <div>
-          <h2 className="text-sm text-gray-600 mb-1">Family</h2>
-          <div className="text-base font-semibold truncate" title={familyName || 'Family'}>{familyName || 'Family'}</div>
-          {families.length > 0 && (
-            <div className="mt-2">
-              <select
-                className="border rounded px-2 py-1 w-full"
-                value={familyId ?? ''}
-                onChange={async (e) => { const id = e.target.value; window.location.href = `/families/${id}/tree`; }}
-              >
-                {families.map((f) => (<option key={f.id} value={f.id}>{f.name}</option>))}
-              </select>
-            </div>
-          )}
+    <main className="h-[calc(100dvh-96px)] mx-4 my-0 border rounded overflow-hidden flex flex-col">
+      {/* Top Toolbar */}
+  <div ref={toolbarRef} className="flex flex-wrap items-center gap-2 p-2 border-b bg-white text-sm relative z-20">
+        <div className="flex items-center gap-1">
+          <label className="text-xs text-gray-600">Relationship</label>
+          <select className="border rounded px-2 py-1" value={edgeType} onChange={(e)=>setEdgeType((e.target.value||'') as any)}>
+            <option value="">Type…</option>
+            <option value="MOTHER">MOTHER</option>
+            <option value="FATHER">FATHER</option>
+            <option value="SPOUSE">SPOUSE</option>
+            <option value="SON">SON</option>
+            <option value="DAUGHTER">DAUGHTER</option>
+          </select>
+          {edgeType && <span className="px-2 py-0.5 text-[11px] rounded-full bg-blue-100 text-blue-700 font-medium">{edgeType}</span>}
         </div>
-
-        {/* Relationship type controls used both for manual connections and auto-link on add */}
-        <div>
-          <h2 className="font-semibold mb-2">Relationship Type</h2>
-          <div className="space-y-2">
-            <select className="border rounded px-2 py-1 w-full" value={edgeType} onChange={(e) => { setEdgeType((e.target.value || '') as any); }}>
-              <option value="" disabled>Select relationship…</option>
-              <option value="PARENT">PARENT</option>
-              <option value="SPOUSE">SPOUSE</option>
-              <option value="SON">SON</option>
-              <option value="DAUGHTER">DAUGHTER</option>
+        <button className="bg-gray-800 text-white px-3 py-1 rounded" onClick={()=>{ setShowAddPerson(p=>!p); setShowAddRel(false); }}>Add Person</button>
+        <button className="bg-gray-800 text-white px-3 py-1 rounded" onClick={()=>{ setShowAddRel(p=>!p); setShowAddPerson(false); }}>Add Relationship</button>
+        <button className="border px-3 py-1 rounded bg-white hover:bg-gray-50" onClick={()=>setShowMore(m=>!m)}>More ▾</button>
+        {showMore && (
+          <div className="absolute top-full left-0 mt-1 w-[260px] bg-white border rounded shadow text-xs p-2 z-30 space-y-1">
+            <div className="flex items-center justify-between">
+              <span>Snap to grid</span>
+              <input type="checkbox" checked={snap} onChange={(e)=>setSnap(e.target.checked)} />
+            </div>
+            <button className="w-full text-left px-2 py-1 rounded hover:bg-gray-100" onClick={()=>{ try { rfInstance?.fitView?.({ padding:0.2 }); } catch {}; setShowMore(false); }}>Fit View (F)</button>
+            <button className="w-full text-left px-2 py-1 rounded hover:bg-gray-100" onClick={async ()=>{ try { await navigator.clipboard.writeText(window.location.href); toast.success('Link copied'); } catch {}; setShowMore(false); }}>Copy Link</button>
+            <button className="w-full text-left px-2 py-1 rounded hover:bg-gray-100" onClick={async ()=>{ const el=canvasRef.current as HTMLDivElement|null; if(!el) return; try { const dataUrl= await htmlToImage.toPng(el,{pixelRatio:2}); const a=document.createElement('a'); a.href=dataUrl; a.download=`family-tree-${familyId||'export'}.png`; a.click(); } catch { toast.error('Export failed'); } setShowMore(false); }}>Export PNG</button>
+            {selectedNode && selectedNode.id !== currentUserId && <button className="w-full text-left px-2 py-1 rounded hover:bg-red-50 hover:text-red-700" onClick={async ()=>{ if(!familyId||!selectedNode) return; if(selectedNode.id===currentUserId){ toast.error('You cannot delete yourself'); return; } try { await api(`/families/${familyId}/nodes/${selectedNode.id}`, { method:'DELETE'}); toast.success('Person removed'); } catch (e:any) { toast.error(e?.message||'Delete failed'); } setNodes(prev=>prev.filter(n=>n.id!==selectedNode.id)); setSelectedNodeId(null); setShowMore(false); }}>Delete Selected Node</button>}
+            {selectedEdgeId && <button className="w-full text-left px-2 py-1 rounded hover:bg-red-50 hover:text-red-700" onClick={async ()=>{ if(!familyId||!selectedEdgeId) return; try { await api(`/families/${familyId}/edges/${selectedEdgeId}`, { method:'DELETE'}); toast.success('Relationship removed'); } catch { toast.error('Delete failed'); } setEdges(prev=>prev.filter(e=>e.id!==selectedEdgeId)); setSelectedEdgeId(null); setShowMore(false); }}>Delete Selected Edge</button>}
+            <div className="pt-1 border-t mt-1 text-[10px] text-gray-500">Shortcuts: A Add Person · R Add Relationship · F Fit View</div>
+          </div>
+        )}
+      </div>
+      {/* Popover Panels */}
+      {showAddPerson && (
+        <div className="absolute z-30 bg-white border rounded shadow p-4 w-80 space-y-2 text-sm" style={{ top: toolbarHeight + 100, left: 32 }}>
+          <div className="font-semibold mb-1">Add Person</div>
+          <input value={pName} onChange={(e)=>setPName(e.target.value)} placeholder="Name" className="border rounded px-2 py-1 w-full" />
+          <input value={pEmail} onChange={(e)=>setPEmail(e.target.value)} placeholder="Email" type="email" className="border rounded px-2 py-1 w-full" />
+          <div className="flex gap-2">
+            <select value={pGender} onChange={(e)=>setPGender(e.target.value)} className="border rounded px-2 py-1 w-full">
+              <option value="">Gender</option>
+              <option value="MALE">Male</option>
+              <option value="FEMALE">Female</option>
+              <option value="OTHER">Other</option>
             </select>
-            <p className="text-xs text-gray-500">This type will be used for manual edge creation and to auto-link when adding a new person.</p>
+            <input value={pBirth} onChange={(e)=>setPBirth(e.target.value)} type="date" className="border rounded px-2 py-1 w-full" />
+          </div>
+          <input value={pTemp} onChange={(e)=>setPTemp(e.target.value)} type="password" placeholder="Temp password (min 8)" className="border rounded px-2 py-1 w-full" />
+          <div className="flex justify-between pt-1">
+            <span className="text-[11px] text-gray-500">Will auto-link using selected relationship.</span>
+            <div className="flex gap-2">
+              <button className="text-xs px-2 py-1" onClick={()=>{ setShowAddPerson(false); }}>Cancel</button>
+              <button className="bg-gray-800 text-white px-3 py-1 rounded text-xs" onClick={()=>{ const name = pName.trim(); if(!name){ toast.error('Name required'); return;} upsertNode(name, pEmail.trim()||'', pGender||undefined, pBirth||undefined, pTemp||undefined); setPName(''); setPEmail(''); setPGender(''); setPBirth(''); setPTemp(''); setShowAddPerson(false); }}>Add</button>
+            </div>
           </div>
         </div>
-
-        <div>
-          <h2 className="font-semibold mb-2">Add Person</h2>
-          <div className="space-y-2">
-            <div className="space-y-2">
-              <input value={pName} onChange={(e)=>setPName(e.target.value)} placeholder="Name" className="border rounded px-2 py-1 w-full" required />
-              <input value={pEmail} onChange={(e)=>setPEmail(e.target.value)} placeholder="Email" type="email" className="border rounded px-2 py-1 w-full" required />
-            </div>
-            <div className="space-y-2">
-              <select value={pGender} onChange={(e)=>setPGender(e.target.value)} className="border rounded px-2 py-1 w-full">
-                <option value="">Gender</option>
-                <option value="MALE">Male</option>
-                <option value="FEMALE">Female</option>
-                <option value="OTHER">Other</option>
-              </select>
-              <input value={pBirth} onChange={(e)=>setPBirth(e.target.value)} type="date" placeholder="Birth date" className="border rounded px-2 py-1 w-full" />
-            </div>
-            <input value={pTemp} onChange={(e)=>setPTemp(e.target.value)} type="password" placeholder="Temporary password (min 8 chars)" minLength={8} className="border rounded px-2 py-1 w-full" required />
-            <div className="flex gap-2 justify-end">
-              <button className="bg-gray-800 text-white px-3 py-1 rounded" onClick={() => {
-                const name = pName.trim();
-                if (!name) { toast.error('Name is required'); return; }
-                upsertNode(name, pEmail.trim() || '', pGender || undefined, pBirth || undefined, pTemp || undefined);
-                setPName(''); setPEmail(''); setPGender(''); setPBirth(''); setPTemp('');
-              }}>Add</button>
-            </div>
-            <p className="text-[11px] text-gray-500">Tip: Select a person in the canvas to link from. If none is selected, we’ll link from you.</p>
-          </div>
-        </div>
-
-        <div>
-          <h2 className="font-semibold mb-2">Add Relationship</h2>
-          <div className="space-y-2 text-sm">
+      )}
+      {showAddRel && (
+        <div className="absolute z-30 bg-white border rounded shadow p-4 w-96 space-y-3 text-sm" style={{ top: toolbarHeight + 100, left: 32 }}>
+          <div className="font-semibold">Add Relationship</div>
+          <div className="grid grid-cols-2 gap-3">
             <div>
-              <div className="text-gray-600">From</div>
-              <div className="border rounded px-2 py-1 bg-slate-50 h-9 flex items-center text-xs">{String(nodes.find(n=>n.id===selectedNodeId)?.data?.name || 'Select a node in canvas')}</div>
+              <div className="text-xs text-gray-600 mb-1">From</div>
+              <div className="border rounded px-2 py-1 h-9 flex items-center text-xs bg-slate-50">{String(nodes.find(n=>n.id===selectedNodeId)?.data?.name || 'Select a node')}</div>
             </div>
             <div>
-              <label className="block text-gray-600 mb-1">To</label>
+              <label className="text-xs text-gray-600 mb-1">To</label>
               <select className="border rounded px-2 py-1 w-full" value={manualToId} onChange={(e)=>setManualToId(e.target.value)}>
-                <option value="">Select target…</option>
-                {nodes.filter(n=>n.id!==selectedNodeId).map(n=> (
-                  <option key={n.id} value={n.id}>{String(n.data?.name || 'Unnamed')}</option>
-                ))}
+                <option value="">Select…</option>
+                {nodes.filter(n=>n.id!==selectedNodeId).map(n=> <option key={n.id} value={n.id}>{String(n.data?.name||'Unnamed')}</option>)}
               </select>
             </div>
-            <div>
-              <label className="block text-gray-600 mb-1">Relationship{edgeType ? ` (using global: ${edgeType})` : ''}</label>
-              <select
-                className="border rounded px-2 py-1 w-full disabled:bg-slate-100 disabled:text-slate-500"
-                value={edgeType || manualType}
-                disabled={!!edgeType}
-                onChange={(e)=>setManualType((e.target.value||'') as any)}
-              >
+            <div className="col-span-2">
+              <label className="block text-xs text-gray-600 mb-1">Relationship {edgeType && `(global: ${edgeType})`}</label>
+              <select className="border rounded px-2 py-1 w-full disabled:bg-slate-100" value={manualFormType} disabled={!!edgeType} onChange={(e)=>setManualType((e.target.value||'') as any)}>
                 <option value="">Select type…</option>
-                <option value="PARENT">PARENT</option>
+                <option value="MOTHER">MOTHER</option>
+                <option value="FATHER">FATHER</option>
                 <option value="SPOUSE">SPOUSE</option>
                 <option value="SON">SON</option>
                 <option value="DAUGHTER">DAUGHTER</option>
               </select>
             </div>
-            <div className="flex justify-end">
-              <button
-                className="bg-gray-800 text-white px-3 py-1 rounded disabled:opacity-50"
-                disabled={!selectedNodeId || !manualToId || !effectiveManualType || manualDuplicate}
-                onClick={async ()=>{
-                  if (!familyId || !selectedNodeId || !manualToId || !effectiveManualType) return;
-                  if (selectedNodeId === manualToId) { toast.error('Cannot link to itself'); return; }
-                  if (manualDuplicate) { toast.error('Relationship already exists'); return; }
-                  await createEdge(selectedNodeId, manualToId, effectiveManualType as EdgeType);
-                  setManualToId('');
-                  setManualType('');
-                }}
-              >Add</button>
-            </div>
-            {manualDuplicate && (
-              <p className="text-xs text-orange-600">A relationship between these two already exists{effectiveManualType === 'SPOUSE' ? ' (spouse either direction)' : ''}.</p>
-            )}
-            <p className="text-[11px] text-gray-500">Or drag between node handles (choose type in Relationship Type section first).</p>
           </div>
+          {manualDuplicate && <p className="text-xs text-orange-600 -mt-2">Duplicate relationship exists{manualFormType==='SPOUSE' && ' (either direction)'}.</p>}
+          <div className="flex justify-end gap-2 pt-1">
+            <button className="text-xs px-2 py-1" onClick={()=>setShowAddRel(false)}>Close</button>
+            <button className="bg-gray-800 text-white px-3 py-1 rounded text-xs disabled:opacity-50" disabled={!selectedNodeId || !manualToId || !manualFormType || manualDuplicate} onClick={async ()=>{ if(!familyId||!selectedNodeId||!manualToId||!manualFormType) return; if(selectedNodeId===manualToId){ toast.error('Cannot link to itself'); return;} if(manualDuplicate){ toast.error('Relationship exists'); return;} await createEdge(selectedNodeId, manualToId, manualFormType as EdgeType); setManualToId(''); setManualType(''); setShowAddRel(false); }}>Add</button>
+          </div>
+          <p className="text-[11px] text-gray-500">Tip: you can also drag between node handles (pick a global relationship type first).</p>
         </div>
-
-        {selectedNode && (
-          <div>
-            <h2 className="font-semibold mb-2">Selected Node Position</h2>
-            <div className="flex gap-2 items-center">
-              <label className="text-sm">X</label>
-              <input type="number" className="border rounded px-2 py-1 w-24" value={selectedNode.position.x}
-                onChange={(e) => updateSelectedPosition(Number(e.target.value), selectedNode.position.y)} />
-              <label className="text-sm">Y</label>
-              <input type="number" className="border rounded px-2 py-1 w-24" value={selectedNode.position.y}
-                onChange={(e) => updateSelectedPosition(selectedNode.position.x, Number(e.target.value))} />
-            </div>
-          </div>
-        )}
-      </aside>
-
-  <section className="h-full w-full relative" ref={canvasRef}>
+      )}
+      <section className="flex-1 relative" ref={canvasRef}>
         <div className="absolute z-10 top-2 right-2 flex gap-2 items-center">
-          <label className="text-xs flex items-center gap-1 bg-white/70 border rounded px-2 py-1">
-            <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} />
-            <span>Snap to grid</span>
-          </label>
-          <button
-            className="bg-white/80 backdrop-blur border rounded px-2 py-1 text-sm"
-            onClick={() => { try { rfInstance?.fitView?.({ padding: 0.2 }); } catch {} }}
-          >Fit view</button>
-          <button
-            className="bg-white/80 backdrop-blur border rounded px-2 py-1 text-sm"
-            onClick={async () => {
-              try {
-                await navigator.clipboard.writeText(window.location.href);
-                toast.success('Link copied');
-              } catch {}
-            }}
-          >Copy link</button>
-          {selectedNode && (
-            <button
-              className="bg-white/80 backdrop-blur border rounded px-2 py-1 text-sm"
-              onClick={async () => {
-                if (!familyId || !selectedNode) return;
-                try { await api(`/families/${familyId}/nodes/${selectedNode.id}`, { method: 'DELETE' }); toast.success('Person removed'); }
-                catch { toast.error('Delete failed'); }
-                setNodes((prev) => prev.filter((n) => n.id !== selectedNode.id));
-                setSelectedNodeId(null);
-              }}
-            >Delete node</button>
-          )}
-          {selectedEdgeId && (
-            <button
-              className="bg-white/80 backdrop-blur border rounded px-2 py-1 text-sm"
-              onClick={async () => {
-                if (!familyId || !selectedEdgeId) return;
-                try { await api(`/families/${familyId}/edges/${selectedEdgeId}`, { method: 'DELETE' }); toast.success('Relationship removed'); }
-                catch { toast.error('Delete failed'); }
-                setEdges((prev) => prev.filter((e) => e.id !== selectedEdgeId));
-                setSelectedEdgeId(null);
-              }}
-            >Delete edge</button>
-          )}
-          <button
-            className="bg-white/80 backdrop-blur border rounded px-2 py-1 text-sm"
-          onClick={async () => {
-            const el = canvasRef.current as HTMLDivElement | null;
-            if (!el) return;
-            try {
-              const dataUrl = await htmlToImage.toPng(el, { pixelRatio: 2 });
-              const a = document.createElement('a');
-              a.href = dataUrl;
-              a.download = `family-tree-${familyId || 'export'}.png`;
-              a.click();
-            } catch (e) { toast.error('Export failed'); }
-          }}
-          >Export PNG</button>
+          {/* retained empty overlay spot (previous floating controls replaced by toolbar) */}
         </div>
         <ReactFlow
           nodes={nodes}
@@ -413,7 +349,7 @@ export default function FamilyTreeByIdPage() {
             const type = e.data?.type ?? e.label;
             const base = { ...e, label: type } as any;
             // Uniform blue color; arrow for directional parent-like edges
-            if (type === 'PARENT' || type === 'SON' || type === 'DAUGHTER') {
+            if (type === 'MOTHER' || type === 'FATHER' || type === 'SON' || type === 'DAUGHTER') {
               return { ...base, markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: '#2563eb' } };
             }
             return { ...base, style: { stroke: '#2563eb' } };
@@ -423,6 +359,7 @@ export default function FamilyTreeByIdPage() {
           onNodeDragStop={onNodeDragStop}
           onSelectionChange={(sel) => { setSelectedNodeId(sel.nodes?.[0]?.id ?? null); setSelectedEdgeId(sel.edges?.[0]?.id ?? null); }}
           onInit={(inst) => setRfInstance(inst)}
+          onMove={(_, viewport) => { setTransformState({ x: viewport.x, y: viewport.y, zoom: viewport.zoom }); }}
           snapToGrid={snap}
           fitView
           nodeTypes={{ personNode: PersonNode }}
@@ -430,23 +367,45 @@ export default function FamilyTreeByIdPage() {
           <Background />
           <Controls />
         </ReactFlow>
+        {selectedNode && (
+          (() => {
+            const { x, y, zoom } = transformState;
+            const sx = selectedNode.position.x * zoom + x;
+            const sy = selectedNode.position.y * zoom + y - 40; // offset above node
+            return (
+              <div className="absolute bg-white/90 backdrop-blur border rounded shadow px-2 py-1 text-[11px] flex gap-1 items-center" style={{ transform: `translate(${sx}px, ${sy}px)` }}>
+                <span className="text-gray-500">X</span>
+                <input type="number" className="border rounded px-1 w-16" value={selectedNode.position.x} onChange={(e)=>updateSelectedPosition(Number(e.target.value), selectedNode.position.y)} />
+                <span className="text-gray-500">Y</span>
+                <input type="number" className="border rounded px-1 w-16" value={selectedNode.position.y} onChange={(e)=>updateSelectedPosition(selectedNode.position.x, Number(e.target.value))} />
+              </div>
+            );
+          })()
+        )}
       </section>
     </main>
   );
 }
 
-        function PersonNode({ data }: any) {
-  const info: string[] = [];
-  if (data?.gender) info.push(String(data.gender));
-  if (data?.birthDate || data?.deathDate) info.push(`${data.birthDate ?? '?'} - ${data.deathDate ?? ''}`.trim());
+function PersonNode({ data }: any) {
+  const gender = data?.gender;
+  let symbol: string = '';
+  if (gender === 'MALE') symbol = 'M';
+  else if (gender === 'FEMALE') symbol = 'F';
+  else if (gender) symbol = '•';
   return (
-            <div className="px-3 py-2 rounded border bg-white shadow-sm min-w-40 max-w-64 relative">
-              {/* Handles to allow manual edge creation */}
-              <Handle type="target" position={Position.Left} className="!w-2 !h-2" />
-              <Handle type="source" position={Position.Right} className="!w-2 !h-2" />
-      <div className="font-medium text-sm truncate" title={data?.name || 'Unnamed'}>{data?.name || 'Unnamed'}</div>
-      {data?.email && <div className="text-xs text-gray-500 truncate" title={data.email}>{data.email}</div>}
-      {info.length > 0 && <div className="text-[10px] text-gray-600">{info.join(' • ')}</div>}
+    <div className="px-3 py-2 rounded-xl border border-slate-300 bg-white shadow-sm min-w-[140px] max-w-[180px] relative flex items-center gap-2">
+      {/* Handles to allow manual edge creation */}
+      <Handle type="target" position={Position.Left} className="!w-2 !h-2" />
+      <Handle type="source" position={Position.Right} className="!w-2 !h-2" />
+      <div className="flex-1 min-w-0">
+        <div className="font-medium text-sm truncate" title={data?.name || 'Unnamed'}>{data?.name || 'Unnamed'}</div>
+      </div>
+      {symbol && (
+        <span className={"shrink-0 inline-flex items-center justify-center w-6 h-6 rounded-full text-[11px] font-semibold border " + (symbol==='M' ? 'bg-blue-100 text-blue-700 border-blue-200' : symbol==='F' ? 'bg-pink-100 text-pink-700 border-pink-200' : 'bg-slate-100 text-slate-600 border-slate-200')} title={gender} aria-label={gender}>
+          {symbol}
+        </span>
+      )}
     </div>
   );
 }

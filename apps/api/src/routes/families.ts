@@ -26,7 +26,7 @@ const updatePositionSchema = z.object({ posX: z.number(), posY: z.number() });
 const createEdgeSchema = z.object({
   sourceId: z.string().min(1),
   targetId: z.string().min(1),
-  type: z.enum(['SPOUSE', 'PARENT', 'SON', 'DAUGHTER']),
+  type: z.enum(['SPOUSE', 'MOTHER', 'FATHER', 'SON', 'DAUGHTER']),
   label: z.string().optional(),
 });
 
@@ -126,13 +126,13 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
         tx.run(
           `MATCH (a:Person)-[r:SPOUSE_OF|PARENT_OF]->(b:Person)
            WHERE (a)-[:MEMBER_OF]->(:Family { id: $familyId }) AND (b)-[:MEMBER_OF]->(:Family { id: $familyId })
-           RETURN a.id as source, b.id as target, type(r) as type, coalesce(r.id, '') as id, r.label as label`,
+           RETURN a.id as source, b.id as target, type(r) as rawType, coalesce(r.id, '') as id, r.label as label`,
           { familyId }
         )
       );
       const edges = edgesRes.records.map((r) => {
-        const rawType = r.get('type') as string; // 'SPOUSE_OF' | 'PARENT_OF'
-        const label = r.get('label') as string | null; // may be 'PARENT'|'SON'|'DAUGHTER'|'SPOUSE'
+        const rawType = r.get('rawType') as string; // 'SPOUSE_OF' | 'PARENT_OF'
+        const label = r.get('label') as string | null; // 'MOTHER'|'FATHER'|'SON'|'DAUGHTER'|'SPOUSE'
         const normalized = label ?? (rawType === 'PARENT_OF' ? 'PARENT' : 'SPOUSE');
         return {
           id: r.get('id') || `${r.get('source')}-${r.get('target')}-${normalized}`,
@@ -262,6 +262,10 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
   app.delete('/families/:id/nodes/:nodeId', { preHandler: requireAuth }, async (req, reply) => {
     const familyId = (req.params as any).id as string;
     const nodeId = (req.params as any).nodeId as string;
+    const userId = req.user!.sub;
+    if (nodeId === userId) {
+      return reply.code(403).send({ message: 'You cannot delete your own node' });
+    }
     const driver = getDriver();
     const session = driver.session();
     try {
@@ -323,7 +327,7 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
   getIO()?.to(familyId).emit('edge:created', edge);
   return reply.code(201).send({ edge });
       } else {
-        // PARENT, SON, DAUGHTER will be represented as PARENT_OF edge; label carries the specific type
+        // MOTHER, FATHER, SON, DAUGHTER are stored as PARENT_OF with a specific label
     const res = await session.executeWrite((tx) =>
           tx.run(
             `MATCH (a:Person { id: $sourceId })-[:MEMBER_OF]->(:Family { id: $familyId }),
