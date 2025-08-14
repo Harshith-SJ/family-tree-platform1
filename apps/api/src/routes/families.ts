@@ -4,6 +4,7 @@ import { getDriver } from '../lib/neo4j';
 import bcrypt from 'bcryptjs';
 import { getIO } from '../socket/io';
 import { requireAuth } from '../middleware/auth';
+import { ensureAdminInFamilyParam } from '../middleware/roles';
 
 const createFamilySchema = z.object({ name: z.string().min(2) });
 
@@ -26,7 +27,7 @@ const updatePositionSchema = z.object({ posX: z.number(), posY: z.number() });
 const createEdgeSchema = z.object({
   sourceId: z.string().min(1),
   targetId: z.string().min(1),
-  type: z.enum(['SPOUSE', 'MOTHER', 'FATHER', 'SON', 'DAUGHTER']),
+  type: z.enum(['SPOUSE', 'PARENT']),
   label: z.string().optional(),
 });
 
@@ -38,57 +39,26 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
   // List families for current user
   app.get('/families', { preHandler: requireAuth }, async (req, reply) => {
     const userId = req.user!.sub;
-    const driver = getDriver();
-    const session = driver.session();
+    const session = getDriver().session();
     try {
-      const result = await session.executeRead((tx) =>
-        tx.run(
-          `MATCH (:Person { id: $userId })-[:MEMBER_OF]->(f:Family)
-           RETURN f ORDER BY f.createdAt DESC`
-          , { userId }
-        )
-      );
-      const families = result.records.map((r) => r.get('f').properties);
-      return { families };
-    } finally {
-      await session.close();
-    }
+      const res = await session.executeRead(tx=>tx.run(`MATCH (:Person { id:$userId })-[:MEMBER_OF]->(f:Family) RETURN f ORDER BY f.createdAt DESC`, { userId }));
+      const families = res.records.map(r=>r.get('f').properties);
+      return reply.send({ families });
+    } finally { await session.close(); }
   });
 
-  // Create a family and link current user
+  // Create a new family (single per user rule)
   app.post('/families', { preHandler: requireAuth }, async (req, reply) => {
     const body = createFamilySchema.parse(req.body as unknown);
     const userId = req.user!.sub;
-    const driver = getDriver();
-    const session = driver.session();
+    const session = getDriver().session();
     try {
-      // Disallow creating more than one family per user
-      const existing = await session.executeRead((tx) =>
-        tx.run(
-          `MATCH (:Person { id: $userId })-[:MEMBER_OF]->(f:Family)
-           RETURN f LIMIT 1`,
-          { userId }
-        )
-      );
-      const existingFam = existing.records[0]?.get('f');
-      if (existingFam) {
-        return reply.code(409).send({ message: 'You already belong to a family. Creating multiple families is not allowed.', family: existingFam.properties });
-      }
-
-      const result = await session.executeWrite((tx) =>
-        tx.run(
-          `MATCH (u:Person { id: $userId })
-           CREATE (f:Family { id: randomUUID(), name: $name, createdAt: datetime() })
-           MERGE (u)-[:MEMBER_OF]->(f)
-           RETURN f`,
-          { userId, name: body.name }
-        )
-      );
-      const f = result.records[0]?.get('f');
-      return reply.code(201).send({ family: f.properties });
-    } finally {
-      await session.close();
-    }
+      const existing = await session.executeRead(tx=>tx.run(`MATCH (:Person { id:$userId })-[:MEMBER_OF]->(f:Family) RETURN f LIMIT 1`, { userId }));
+      if (existing.records.length>0) return reply.code(409).send({ message:'You already belong to a family', family: existing.records[0].get('f').properties });
+  const created = await session.executeWrite(tx=>tx.run(`MATCH (u:Person { id:$userId }) CREATE (f:Family { id:randomUUID(), name:$name, createdAt:datetime() }) MERGE (u)-[m:MEMBER_OF]->(f) ON CREATE SET m.role='ADMIN' RETURN f`, { userId, name: body.name }));
+      const fam = created.records[0].get('f').properties;
+      return reply.code(201).send({ family: fam });
+    } finally { await session.close(); }
   });
 
   // Get tree (nodes and edges) for a family
@@ -100,6 +70,7 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
       const nodesRes = await session.executeRead((tx) =>
         tx.run(
           `MATCH (p:Person)-[:MEMBER_OF]->(:Family { id: $familyId })
+           WHERE p.deletedAt IS NULL
            RETURN p`,
           { familyId }
         )
@@ -122,25 +93,20 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
         };
       });
 
-      const edgesRes = await session.executeRead((tx) =>
-        tx.run(
-          `MATCH (a:Person)-[r:SPOUSE_OF|PARENT_OF]->(b:Person)
-           WHERE (a)-[:MEMBER_OF]->(:Family { id: $familyId }) AND (b)-[:MEMBER_OF]->(:Family { id: $familyId })
-           RETURN a.id as source, b.id as target, type(r) as rawType, coalesce(r.id, '') as id, r.label as label`,
-          { familyId }
-        )
-      );
-      const edges = edgesRes.records.map((r) => {
-        const rawType = r.get('rawType') as string; // 'SPOUSE_OF' | 'PARENT_OF'
-        const label = r.get('label') as string | null; // 'MOTHER'|'FATHER'|'SON'|'DAUGHTER'|'SPOUSE'
-        const normalized = label ?? (rawType === 'PARENT_OF' ? 'PARENT' : 'SPOUSE');
-        return {
-          id: r.get('id') || `${r.get('source')}-${r.get('target')}-${normalized}`,
-          source: r.get('source'),
-          target: r.get('target'),
-          label: normalized,
-          data: { type: normalized },
-        };
+  const edgesRes = await session.executeRead(tx=>tx.run(`MATCH (a:Person)-[r:SPOUSE_OF|PARENT_OF]->(b:Person)
+       WHERE (a)-[:MEMBER_OF]->(:Family { id: $familyId }) AND (b)-[:MEMBER_OF]->(:Family { id: $familyId }) AND a.deletedAt IS NULL AND b.deletedAt IS NULL AND coalesce(r.deletedAt,'')=''
+       RETURN a.id as source, b.id as target, type(r) as rawType, coalesce(r.id,'') as id, r.label as storedLabel, a.gender as aGender`, { familyId }));
+      const edges = edgesRes.records.map(r=>{
+        const rawType = r.get('rawType');
+        const stored = r.get('storedLabel');
+        let label = stored;
+        if (rawType === 'PARENT_OF') {
+          const g = r.get('aGender');
+          label = g === 'FEMALE' ? 'MOTHER' : g === 'MALE' ? 'FATHER' : 'PARENT';
+        }
+        if (!label && rawType === 'SPOUSE_OF') label = 'SPOUSE';
+        const id = r.get('id') || `${r.get('source')}-${r.get('target')}-${label}`;
+        return { id, source: r.get('source'), target: r.get('target'), label, data:{ type: label } };
       });
 
       return { nodes, edges };
@@ -259,7 +225,7 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
   });
 
   // Delete a node and its relationships within a family
-  app.delete('/families/:id/nodes/:nodeId', { preHandler: requireAuth }, async (req, reply) => {
+  app.delete('/families/:id/nodes/:nodeId', { preHandler: [requireAuth, ensureAdminInFamilyParam('id')] }, async (req, reply) => {
     const familyId = (req.params as any).id as string;
     const nodeId = (req.params as any).nodeId as string;
     const userId = req.user!.sub;
@@ -272,9 +238,9 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
       const res = await session.executeWrite((tx) =>
         tx.run(
           `MATCH (p:Person { id: $nodeId })-[:MEMBER_OF]->(:Family { id: $familyId })
-           WITH p
-           DETACH DELETE p
-           RETURN $nodeId as id`,
+           WHERE p.deletedAt IS NULL
+           SET p.deletedAt = datetime(), p.updatedAt = datetime()
+           RETURN p.id as id`,
           { familyId, nodeId }
         )
       );
@@ -287,7 +253,7 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
   });
 
   // Create edge/relationship
-  app.post('/families/:id/edges', { preHandler: requireAuth }, async (req, reply) => {
+  app.post('/families/:id/edges', { preHandler: [requireAuth, ensureAdminInFamilyParam('id')] }, async (req, reply) => {
     const familyId = (req.params as any).id as string;
     const body = createEdgeSchema.parse(req.body as unknown);
     const driver = getDriver();
@@ -323,27 +289,31 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
         );
         const r = res.records[0]?.get('r');
         if (!r) return reply.code(400).send({ message: 'Could not create spouse relationship' });
-        const edge = { id: r.properties.id, sourceId: body.sourceId, targetId: body.targetId, type: body.type, label: r.properties.label };
+  // spouse edge label stays 'SPOUSE'
+  const edge = { id: r.properties.id, sourceId: body.sourceId, targetId: body.targetId, type: 'SPOUSE', label: 'SPOUSE' };
   getIO()?.to(familyId).emit('edge:created', edge);
   return reply.code(201).send({ edge });
       } else {
-        // MOTHER, FATHER, SON, DAUGHTER are stored as PARENT_OF with a specific label
-    const res = await session.executeWrite((tx) =>
+        // Store normalized parent edge with label 'PARENT'
+        const res = await session.executeWrite((tx) =>
           tx.run(
             `MATCH (a:Person { id: $sourceId })-[:MEMBER_OF]->(:Family { id: $familyId }),
                    (b:Person { id: $targetId })-[:MEMBER_OF]->(:Family { id: $familyId })
              MERGE (a)-[r:PARENT_OF]->(b)
-             SET r.id = coalesce(r.id, randomUUID()), r.label = coalesce(r.label, coalesce($label, $type))
+             SET r.id = coalesce(r.id, randomUUID()), r.label = 'PARENT'
              RETURN r`,
-      { familyId, ...body, label: body.label ?? null, type: body.type }
+            { familyId, sourceId: body.sourceId, targetId: body.targetId }
           )
         );
         const r = res.records[0]?.get('r');
         if (!r) return reply.code(400).send({ message: 'Could not create parent relationship' });
-        const edge = { id: r.properties.id, sourceId: body.sourceId, targetId: body.targetId, type: body.type, label: r.properties.label };
-  getIO()?.to(familyId).emit('edge:created', edge);
-  return reply.code(201).send({ edge });
-       }
+  const parentPersonGenderRes = await session.executeRead(tx=>tx.run(`MATCH (p:Person { id:$sid }) RETURN p.gender as g`, { sid: body.sourceId }));
+  const g = parentPersonGenderRes.records[0]?.get('g');
+  const label = g === 'FEMALE' ? 'MOTHER' : g === 'MALE' ? 'FATHER' : 'PARENT';
+  const edge = { id: r.properties.id, sourceId: body.sourceId, targetId: body.targetId, type: label, label };
+        getIO()?.to(familyId).emit('edge:created', edge);
+        return reply.code(201).send({ edge });
+      }
      } catch (err: any) {
       req.log.error({ err, familyId, body }, 'Failed to create edge');
       return reply.code(500).send({ message: 'Failed to create relationship', error: String(err?.message || err) });
@@ -352,8 +322,23 @@ export async function registerFamilyRoutes(app: FastifyInstance) {
     }
   });
 
+  // Update a member's role (admin only)
+  app.patch('/families/:id/members/:memberId/role', { preHandler: [requireAuth, ensureAdminInFamilyParam('id')] }, async (req, reply) => {
+    const familyId = (req.params as any).id as string;
+    const memberId = (req.params as any).memberId as string;
+    const body = (req.body as any) || {};
+    const newRole = body.role;
+    if(!['ADMIN','MEMBER'].includes(newRole)) return reply.code(400).send({ message:'Invalid role' });
+    const session = getDriver().session();
+    try {
+      const res = await session.executeWrite(tx=>tx.run(`MATCH (p:Person { id:$memberId })-[m:MEMBER_OF]->(f:Family { id:$familyId }) SET m.role=$role RETURN m.role as role`, { memberId, familyId, role:newRole }));
+      if(res.records.length===0) return reply.code(404).send({ message:'Member not found in family' });
+      return reply.send({ memberId, role:newRole });
+    } finally { await session.close(); }
+  });
+
   // Delete an edge/relationship by id
-  app.delete('/families/:id/edges/:edgeId', { preHandler: requireAuth }, async (req, reply) => {
+  app.delete('/families/:id/edges/:edgeId', { preHandler: [requireAuth, ensureAdminInFamilyParam('id')] }, async (req, reply) => {
     const familyId = (req.params as any).id as string;
     const edgeId = (req.params as any).edgeId as string;
     const driver = getDriver();

@@ -14,4 +14,5 @@ export const env = {
   NEO4J_PASSWORD: required('NEO4J_PASSWORD'),
   JWT_SECRET: required('JWT_SECRET'),
   JWT_EXPIRES_IN: process.env.JWT_EXPIRES_IN || '1d',
+  BCRYPT_ROUNDS: parseInt(process.env.BCRYPT_ROUNDS || '10', 10)
 };
